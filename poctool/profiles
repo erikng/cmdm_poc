@@ -1,0 +1,553 @@
+#!/usr/bin/python
+
+# C-MDM poc code
+# Written by Erik Gomez
+# Requires requests python library
+# Requires AirWatch 9.1 or higher and a macOS device enrolled in AirWatch.
+# OR
+# Requires MicroMDM and a macOS device enrolled in MicroMDM.
+
+from Foundation import NSBundle
+import base64
+import json
+import objc
+import optparse
+import os
+import plistlib
+import requests
+import subprocess
+import time
+
+# Setup these values
+# api authorization username and password, base64 encoded
+# base64.b64encode('username:password')
+authorization = ''
+
+# Baseurl for your MDM server (https://yourmdm.tld)
+baseurl = ''
+
+# AirWatch settings
+# AirWatch tenant code which is a pre-base64 encoded string.
+airwatchtenantcode = ''
+airwatch = False
+
+# MicroMDM settings
+micromdm = False
+# If you are testing micromdm locally, you may want to turn off SSL
+# verification, by changing this to True.
+localtest = False
+
+# C-MDM settings
+# By default, C-MDM will attempt to cache the computer's MDM ID. This will
+# result in half of the API calls per profile installation or removal. Caching
+# will be attempted on the first run of this tool. By caching the computer's
+# MDM ID, the CM run time will be significantly shortened.
+cachecomputerid = True
+# By default, C-MDM will not validate profile installation or removal. This
+# mimics the behavior of CM tools as they simply shell out to /usr/bin/profiles
+# but do not actually check if the installation/removal has occured until the
+# subsequent CM run. By skipping validation, the CM run time will be
+# significantly shortened.
+validateprofiles = False
+
+
+def get_serial():
+    # Credit to Michael Lynn
+    IOKit_bundle = NSBundle.bundleWithIdentifier_("com.apple.framework.IOKit")
+    functions = [
+        ("IOServiceGetMatchingService", b"II@"),
+        ("IOServiceMatching", b"@*"),
+        ("IORegistryEntryCreateCFProperty", b"@I@@I")
+    ]
+    objc.loadBundleFunctions(IOKit_bundle, globals(), functions)
+
+    kIOMasterPortDefault = 0
+    kIOPlatformSerialNumberKey = 'IOPlatformSerialNumber'
+    kCFAllocatorDefault = None
+
+    platformExpert = IOServiceGetMatchingService(
+        kIOMasterPortDefault,
+        IOServiceMatching("IOPlatformExpertDevice")
+    )
+    serial = IORegistryEntryCreateCFProperty(
+        platformExpert,
+        kIOPlatformSerialNumberKey,
+        kCFAllocatorDefault,
+        0
+    )
+    return serial
+
+
+def get_aw_deviceid(baseurl, headers, serial):
+    url = "%s/api/mdm/devices" % baseurl
+    query = {"searchby": "Serialnumber", "id": serial}
+    try:
+        response = requests.request("GET", url, headers=headers, params=query)
+        code = response.status_code
+        if code == 200:
+            data = response.json()
+            return True, data['Id']['Value']
+        else:
+            return False, 'Did not obtain device ID.'
+    except KeyError, error:
+        return None
+
+
+def send_aw_command(baseurl, awid, headers, command):
+    url = "%s/api/mdm/devices/%s/commands?command=CustomMDMCommand" % (baseurl,
+                                                                       awid)
+    try:
+        response = requests.request("POST", url, headers=headers, data=command)
+        code = response.status_code
+        if code == 202:
+            return True, 'Command successfully sent to device.'
+        elif code == 403:
+            return False, 'Unauthorized.'
+        elif code == 404:
+            return False, 'Bad URL.'
+        elif code == 422:
+            status = response.json()
+            return False, status['message'].strip()
+        else:
+            return False, 'Unknown error.'
+    except KeyError, error:
+        return False, 'Python Exception'
+
+
+def get_mmdm_devices(baseurl, headers, serial):
+    url = "%s/v1/devices" % (baseurl)
+    udid = None
+    try:
+        if localtest:
+            response = requests.request("GET", url, headers=headers,
+                                        verify=False)
+        else:
+            response = requests.request("GET", url, headers=headers)
+        code = response.status_code
+        if code == 200:
+            data = response.json()
+            for device in data['devices']:
+                if serial in device['serial_number']:
+                    udid = device['udid']
+            if udid:
+                return True, udid
+            else:
+                return False, 'Did not obtain device ID.'
+        else:
+            return False, 'Did not obtain device ID.'
+    except KeyError, error:
+        return False, 'Python Exception'
+
+
+def send_mmdm_command(baseurl, headers, command):
+    url = "%s/v1/commands" % (baseurl)
+    try:
+        if localtest:
+            response = requests.request("POST", url, headers=headers,
+                                        data=command, verify=False)
+        else:
+            response = requests.request("POST", url, headers=headers,
+                                        data=command)
+        code = response.status_code
+        if code == 200:
+            return True, 'Command successfully sent to device.'
+        elif code == 401:
+            return False, 'Unauthorized.'
+        else:
+            return False, 'Unknown error.'
+    except KeyError, error:
+        return False, 'Python Exception'
+
+
+def print_profiles(profilepath):
+    try:
+        proc = subprocess.Popen(['/usr/bin/profiles', '-P', '-o', profilepath],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        output, _ = proc.communicate()
+        return output
+    except (IOError, OSError, TypeError):
+        return False
+
+
+def install_profile(profilepath):
+    try:
+        proc = subprocess.Popen(['/usr/bin/profiles', '-I', '-F', profilepath],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        output, _ = proc.communicate()
+        return output
+    except (IOError, OSError, TypeError):
+        return False
+
+
+def sign_profile(profilepath, signingcert, signedprofilepath):
+    try:
+        cmd = ['/usr/bin/security', 'cms', '-S', '-N', signingcert, '-i',
+               profilepath, '-o', signedprofilepath, '-k',
+               '/Library/Keychains/System.keychain']
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        output, _ = proc.communicate()
+        return output
+    except (IOError, OSError, TypeError):
+        return False
+
+
+def find_signing_cert():
+    try:
+        proc = subprocess.Popen(['/usr/bin/security', 'find-identity', '-p',
+                                 'codesigning', '-v',
+                                 '/Library/Keychains/System.keychain'],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        output, _ = proc.communicate()
+        # For now just return the first cert.
+        if '0 valid identities found' in output:
+            return False
+        else:
+            firstcert = output.split('\n')[0].split('"')[1]
+            return firstcert
+    except (IOError, OSError, TypeError):
+        return False
+
+
+def remove_profile(profileidentifier):
+    try:
+        proc = subprocess.Popen(['/usr/bin/profiles', '-R', '-p',
+                                 profileidentifier],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        output, _ = proc.communicate()
+        return output
+    except (IOError, OSError, TypeError):
+        return False
+
+
+def check_profile(profileidentifier):
+    installed = False
+    try:
+        proc = subprocess.Popen(['/usr/bin/profiles', '-L'],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        output, _ = proc.communicate()
+        profilelist = output.split('\n')
+        for profile in profilelist:
+            if profileidentifier in profile:
+                installed = True
+                return installed
+        return installed
+    except (IOError, OSError, TypeError):
+        return False
+
+
+def main():
+    usage = '%prog [options]'
+    o = optparse.OptionParser(usage=usage)
+    o.add_option('-I', '--installprofile', default=None, action='store_true',
+                 help=('Required: Local path to profile to install.'))
+    o.add_option('-F', '--profilepath', default=None, help=(
+        'Required: Local path to profile to install.'))
+    o.add_option('-P', '--printprofiles', default=None, action='store_true',
+                 help=('Required: Local path to profile to install.'))
+    o.add_option('-o', '--outputfile', default=None, help=(
+        'Required: Local path to profile to install.'))
+    o.add_option('-R', '--removeprofile', default=None, action='store_true',
+                 help=('Required: Profile identifier to remove.'))
+    o.add_option('-p', '--profileid', default=None,
+                 help=('Required: Profile identifier to remove.'))
+    o.add_option('--machineserial', help=(
+        'Optional: Target macOS serial. If not used, will use local serial.'))
+    opts, args = o.parse_args()
+
+    if opts.printprofiles:
+        if opts.outputfile:
+            print print_profiles(opts.outputfile)
+            exit(0)
+
+    if opts.installprofile and opts.removeprofile:
+        print 'Cannot install and remove profile at the same time!'
+        exit(1)
+
+    if opts.machineserial:
+        serial = opts.machineserial
+    else:
+        serial = get_serial()
+
+    global airwatch
+    global airwatchtenantcode
+    global authorization
+    global baseurl
+    global cachecomputerid
+    global micromdm
+    global validateprofiles
+
+    cmdmpath = '/Library/Application Support/C-MDM'
+    devicedetailsplist = os.path.join(cmdmpath, 'device_details.plist')
+
+    if airwatch and micromdm:
+        print 'Cannot specify both micromdm and airwatch as global variables!'
+        exit(1)
+    elif not airwatch and not micromdm:
+        print 'Must specify either micromdm or airwatch as a global variable!'
+        exit(1)
+
+    if airwatch:
+        headers = {
+            'Authorization': 'Basic ' + authorization,
+            'aw-tenant-code': airwatchtenantcode,
+            'content-type': 'application/json',
+            'accept': 'application/json',
+        }
+    elif micromdm:
+        headers = {
+            'Authorization': 'Basic ' + authorization,
+            'cache-control': 'no-cache',
+            'content-type': 'application/json',
+        }
+
+    installing = False
+    removing = False
+
+    sendsignedcommand = False
+
+    if opts.installprofile:
+        installing = True
+        profilepath = opts.profilepath
+        profilepayload = open(profilepath, 'rb').read()
+        # stupid hack to remove extra blank characters
+        if '                ' in profilepayload:
+            profilepayload = profilepayload.replace('                ', '')
+        if '            ' in profilepayload:
+            profilepayload = profilepayload.replace('            ', '')
+        if '        ' in profilepayload:
+            profilepayload = profilepayload.replace('        ', '')
+        if '    ' in profilepayload:
+            profilepayload = profilepayload.replace('    ', '')
+        profilecontent = plistlib.readPlist(profilepath)
+        installprofileidentifier = profilecontent['PayloadIdentifier']
+        signingcert = find_signing_cert()
+        installsignedprofile = False
+        if signingcert:
+            signedprofilepath = profilepath.split('.mobileconfig')[0] + \
+                '_signed.mobileconfig'
+            sign_profile(profilepath, signingcert, signedprofilepath)
+            signedprofilepayload = open(signedprofilepath, 'rb').read()
+            installsignedprofile = True
+            if airwatch:
+                signedcommand = json.dumps(
+                    {
+                        'CommandXml':
+                        '<dict>'
+                            '<key>RequestType</key>'
+                            '<string>InstallProfile</string>'
+                            '<key>Payload</key>'
+                            '<data>' + base64.b64encode(signedprofilepayload) +
+                            '</data>'
+                        '</dict>'
+                    }
+                )
+                command = json.dumps(
+                    {
+                        'CommandXml':
+                        '<dict>'
+                            '<key>RequestType</key>'
+                            '<string>InstallProfile</string>'
+                            '<key>Payload</key>'
+                            '<data>' + base64.b64encode(profilepayload) +
+                            '</data>'
+                        '</dict>'
+                    }
+                )
+            elif micromdm:
+                sendsignedcommand = True
+        else:
+            if airwatch:
+                command = json.dumps(
+                    {
+                        'CommandXml':
+                        '<dict>'
+                            '<key>RequestType</key>'
+                            '<string>InstallProfile</string>'
+                            '<key>Payload</key>'
+                            '<data>' + base64.b64encode(profilepayload) +
+                            '</data>'
+                        '</dict>'
+                    }
+                )
+
+        if airwatch:
+            if installsignedprofile:
+                if len(signedcommand) > 2000 and len(command) > 2000:
+                    print 'Currently AirWatch limits the payload portion to '\
+                        '2000 characters. This signed profile is not '\
+                        'compatible for installation via the api. Your '\
+                        'length: %s' % str(len(signedcommand))
+                    print 'Currently AirWatch limits the payload portion to '\
+                        '2000 characters. This unsigned profile is not '\
+                        'compatible for installation via the api. Your '\
+                        'length: %s' % str(len(command))
+                    print 'Installing signed profile via /usr/bin/profiles'
+                    sendsignedcommand = True
+                    install_profile(signedprofilepath)
+                    exit(0)
+                elif len(signedcommand) > 2000 and len(command) <= 2000:
+                    print 'Currently AirWatch limits the payload portion to '\
+                        '2000 characters. This signed profile is not '\
+                        'compatible for installation via the api. Your '\
+                        'length: %s' % str(len(signedcommand))
+                    print 'Unsigned profile is less than 2000 characters and '\
+                        'can be sent to AirWatch. Sending...'
+                else:
+                    sendsignedcommand = True
+            else:
+                if len(command) > 2000:
+                    print 'Currently AirWatch limits the payload portion to '\
+                        '2000 characters. This unsigned profile is not '\
+                        'compatible for installation via the api. Your '\
+                        'length: %s' % str(len(command))
+                    print 'Installing unsigned profile via /usr/bin/profiles'
+                    install_profile(profilepath)
+                    exit(0)
+        elif micromdm:
+            if installsignedprofile:
+                if len(signedcommand) > 10000 and len(command) > 10000:
+                    print 'Currently MicroMDM limits the payload portion to '\
+                        '10000 characters. This signed profile is not '\
+                        'compatible for installation via the api. Your '\
+                        'length: %s' % str(len(signedcommand))
+                    print 'Currently MicroMDM limits the payload portion to '\
+                        '10000 characters. This unsigned profile is not '\
+                        'compatible for installation via the api. Your '\
+                        'length: %s' % str(len(command))
+                    print 'Installing signed profile via /usr/bin/profiles'
+                    sendsignedcommand = True
+                    install_profile(signedprofilepath)
+                    exit(0)
+                elif len(signedcommand) > 10000 and len(command) <= 10000:
+                    print 'Currently MicroMDM limits the payload portion to '\
+                        '10000 characters. This signed profile is not '\
+                        'compatible for installation via the api. Your '\
+                        'length: %s' % str(len(signedcommand))
+                    print 'Unsigned profile is less than 2000 characters and '\
+                        'can be sent to AirWatch. Sending...'
+                else:
+                    sendsignedcommand = True
+            else:
+                if len(command) > 10000:
+                    print 'Currently MicroMDM limits the payload portion to '\
+                        '10000 characters. This unsigned profile is not '\
+                        'compatible for installation via the api. Your '\
+                        'length: %s' % str(len(command))
+                    print 'Installing unsigned profile via /usr/bin/profiles'
+                    install_profile(profilepath)
+                    exit(0)
+
+    elif opts.removeprofile:
+        if airwatch:
+            removing = True
+            profileidentifier = opts.profileid
+            command = json.dumps(
+                {
+                    'CommandXml':
+                    '<dict>'
+                        '<key>RequestType</key>'
+                        '<string>RemoveProfile</string>'
+                        '<key>Identifier</key>'
+                        '<string>' + profileidentifier + '</string>'
+                    '</dict>'
+                }
+            )
+        elif micromdm:
+            print 'Currently a bug with MicroMDM - cannot uninstall profiles.'
+            exit(1)
+
+    deviceidiscached = False
+    getdeviceid = [False]
+    if cachecomputerid:
+        if os.path.isfile(devicedetailsplist):
+            deviceplist = plistlib.readPlist(devicedetailsplist)
+            if 'UDID' in deviceplist:
+                getdeviceid = True, deviceplist['UDID']
+                deviceidiscached = True
+
+    if not deviceidiscached:
+        if airwatch:
+            getdeviceid = get_aw_deviceid(baseurl, headers, serial)
+        elif micromdm:
+            getdeviceid = get_mmdm_devices(baseurl, headers, serial)
+        if getdeviceid[0] and cachecomputerid:
+            os.makedirs(cmdmpath)
+            deviceinfo = {'UDID': getdeviceid[1]}
+            plistlib.writePlist(deviceinfo, devicedetailsplist)
+
+    if getdeviceid[0]:
+        # Send the command with the profile payload
+        if airwatch:
+            if sendsignedcommand:
+                sentcommand = send_aw_command(baseurl, getdeviceid[1], headers,
+                                              signedcommand)
+            else:
+                sentcommand = send_aw_command(baseurl, getdeviceid[1], headers,
+                                              command)
+        elif micromdm:
+            if sendsignedcommand:
+                signedcommand = json.dumps({
+                    "request_type": "InstallProfile",
+                    "udid": getdeviceid[1],
+                    "payload": base64.b64encode(signedprofilepayload)
+                })
+                sentcommand = send_mmdm_command(baseurl, headers,
+                                                signedcommand)
+            else:
+                command = json.dumps({
+                    "request_type": "InstallProfile",
+                    "udid": getdeviceid[1],
+                    "payload": base64.b64encode(profilepayload)
+                })
+                sentcommand = send_mmdm_command(baseurl, headers, command)
+
+        if sentcommand[0]:
+            if installing:
+                while (not check_profile(installprofileidentifier) and
+                       (validateprofiles)):
+                    print 'Waiting for profile to successfully install...'
+                    time.sleep(1)
+                exit(0)
+            elif removing:
+                while (check_profile(profileidentifier) and validateprofiles):
+                    print 'Waiting for profile to successfully remove...'
+                    time.sleep(1)
+                exit(0)
+        else:
+            if installing:
+                print 'API Failure: Installing profile via /usr/bin/profiles'
+                install_profile(profilepath)
+                while (not check_profile(installprofileidentifier) and
+                       (validateprofiles)):
+                    print 'Waiting for profile to successfully install...'
+                    time.sleep(1)
+            elif removing:
+                print 'API Failure: Removing profile via /usr/bin/profiles'
+                remove_profile(profileidentifier)
+                while (check_profile(profileidentifier) and validateprofiles):
+                    print 'Waiting for profile to successfully remove...'
+                    time.sleep(1)
+    else:
+        if installing:
+            print 'API Failure: Installing profile via /usr/bin/profiles'
+            install_profile(profilepath)
+            while (not check_profile(installprofileidentifier)
+                   and validateprofiles):
+                print 'Waiting for profile to successfully install...'
+                time.sleep(1)
+        elif removing:
+            print 'API Failure: Removing profile via /usr/bin/profiles'
+            remove_profile(profileidentifier)
+            while (check_profile(profileidentifier) and validateprofiles):
+                print 'Waiting for profile to successfully remove...'
+                time.sleep(1)
+
+
+if __name__ == '__main__':
+    main()
