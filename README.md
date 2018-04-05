@@ -24,7 +24,7 @@ You _cannot_ specify both `airwatch` and `micromdm`
 - airwatchtenantcode
 
 ### Optional variables
-- cachecomputerid = True
+- cachecomputerid
 - validateprofiles
 
 ### Optional MicroMDM variables
